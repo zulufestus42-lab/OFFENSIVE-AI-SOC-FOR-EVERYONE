@@ -16,7 +16,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
-    allow_hearders=["*"]
+    allow_headers=["*"]
 )
 
 # Load model artifacts
