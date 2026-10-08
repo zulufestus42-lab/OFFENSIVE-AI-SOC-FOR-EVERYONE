@@ -14,7 +14,7 @@ app = FastAPI(title="OFFENSIVE AI SOC FOR EVERYONE")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=false,
+    allow_credentials=False,
     allow_metholds=["*"],
     allow_hearders=["*"]
 )
