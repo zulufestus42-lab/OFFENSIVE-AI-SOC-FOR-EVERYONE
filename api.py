@@ -1,6 +1,7 @@
 import os
 import warnings
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
 from sklearn.exceptions import InconsistentVersionWarning
@@ -9,6 +10,14 @@ from sklearn.exceptions import InconsistentVersionWarning
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 app = FastAPI(title="OFFENSIVE AI SOC FOR EVERYONE")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=false,
+    allow_metholds=["*"],
+    allow_hearders=["*"]
+)
 
 # Load model artifacts
 model = joblib.load("off_model.joblib")
@@ -20,7 +29,7 @@ labels_map = joblib.load("label_map.joblib")
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "message": "OFFENSIVE AI SOC API is running"}
+    return {"status": "ok", "message": "OFFENSIVE AI SOC FOR EVERYONE"}
 
 
 class Offensive(BaseModel):
