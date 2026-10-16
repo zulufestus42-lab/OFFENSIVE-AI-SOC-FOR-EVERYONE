@@ -43,7 +43,6 @@ def scan(req: Offensive):
     prob = model.predict_proba(vec)[0].max()
 
     return {
-        "CEO": "FESTUS ZULU",
         "PAYLOAD": labels_map[pre],
         "CONFIDENCE": f"{round(float(prob) * 100, 2)}%",
         "ACTION": "BLOCK" if labels_map[pre] != "Benign" else "ALLOW"
