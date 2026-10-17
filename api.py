@@ -192,8 +192,8 @@ def crawler_scan(req: CrawlerRequest):
 
     try:
         headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
-        # Added verify=False to bypass expired or self-signed SSL certificates
-        client = httpx.Client(timeout=10.0, follow_redirects=True, verify=False)
+        # Increased timeout to 30.0s and kept verify=False for robust scanning against slower/expired targets
+        client = httpx.Client(timeout=30.0, follow_redirects=True, verify=False)
         
         response = client.get(target, headers=headers)
         soup = BeautifulSoup(response.text, "html.parser")
