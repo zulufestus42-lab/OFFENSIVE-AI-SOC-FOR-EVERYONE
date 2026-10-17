@@ -12,6 +12,7 @@ from sklearn.exceptions import InconsistentVersionWarning
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from openai import OpenAI
 
 # 1. Suppress scikit-learn version mismatch warnings on model load
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
@@ -53,6 +54,12 @@ model = joblib.load("off_model.joblib")
 vectorizer = joblib.load("tfidf_vectorizer.joblib")
 labels_map = joblib.load("label_map.joblib")
 
+# Initialize OpenAI client pointing to Groq's free endpoint
+llm_client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    api_key=os.environ.get("GROQ_API_KEY")
+)
+
 
 # 2. Add root route to handle Render health checks (fixes HEAD / 404 error)
 @app.get("/")
@@ -67,6 +74,10 @@ class Offensive(BaseModel):
 
 class CrawlerRequest(BaseModel):
     target_url: str
+
+
+class ReportRequest(BaseModel):
+    scan_results: dict
 
 
 @app.post("/v1/scan")
@@ -86,7 +97,6 @@ def scan(req: Offensive, request: Request):
     # Fetch geolocation data (latitude & longitude) based on IP
     latitude, longitude = 0.0, 0.0
     try:
-        # Skip lookup for local/private IPs
         if client_ip not in ["127.0.0.1", "localhost", "::1"]:
             headers = {"User-Agent": "Mozilla/5.0"}
             response = httpx.get(f"https://ipapi.co/{client_ip}/json/", headers=headers, timeout=4.0, verify=False)
@@ -192,7 +202,6 @@ def crawler_scan(req: CrawlerRequest):
 
     try:
         headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
-        # Increased timeout to 30.0s and kept verify=False for robust scanning against slower/expired targets
         client = httpx.Client(timeout=30.0, follow_redirects=True, verify=False)
         
         response = client.get(target, headers=headers)
@@ -279,6 +288,47 @@ def crawler_scan(req: CrawlerRequest):
     except Exception as e:
         return {
             "TARGET": target,
+            "STATUS": "ERROR",
+            "DETAILS": str(e)
+        }
+
+
+# 5. Free LLM-Powered Automated Security Report Generator Endpoint
+@app.post("/v1/report/generate")
+def generate_llm_report(req: ReportRequest):
+    try:
+        findings_json = str(req.scan_results)
+        
+        system_prompt = (
+            "You are the official automated intelligence reporting engine for 'OFFENSIVE AI SOC FOR EVERYONE'. "
+            "Every report you create must prominently display 'OFFENSIVE AI SOC FOR EVERYONE' as the primary header. "
+            "Adopt the persona of an elite CISO and security auditor. "
+            "Analyze the provided live DAST vulnerability findings and output: "
+            "1. Executive Summary branded for 'OFFENSIVE AI SOC FOR EVERYONE' "
+            "2. Technical Attack Vector Breakdown "
+            "3. Production-ready secure remediation code patches."
+        )
+        
+        user_prompt = f"Here are the live target scan results:\n{findings_json}\n\nGenerate the complete CISO security report now."
+
+        response = llm_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+
+        report_text = response.choices[0].message.content
+
+        return {
+            "STATUS": "SUCCESS",
+            "AI_SECURITY_REPORT": report_text
+        }
+
+    except Exception as e:
+        return {
             "STATUS": "ERROR",
             "DETAILS": str(e)
         }
