@@ -89,7 +89,7 @@ def scan(req: Offensive, request: Request):
         # Skip lookup for local/private IPs
         if client_ip not in ["127.0.0.1", "localhost", "::1"]:
             headers = {"User-Agent": "Mozilla/5.0"}
-            response = httpx.get(f"https://ipapi.co/{client_ip}/json/", headers=headers, timeout=4.0)
+            response = httpx.get(f"https://ipapi.co/{client_ip}/json/", headers=headers, timeout=4.0, verify=False)
             if response.status_code == 200:
                 geo_data = response.json()
                 latitude = geo_data.get("latitude", 0.0) or 0.0
@@ -192,7 +192,8 @@ def crawler_scan(req: CrawlerRequest):
 
     try:
         headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
-        client = httpx.Client(timeout=10.0, follow_redirects=True)
+        # Added verify=False to bypass expired or self-signed SSL certificates
+        client = httpx.Client(timeout=10.0, follow_redirects=True, verify=False)
         
         response = client.get(target, headers=headers)
         soup = BeautifulSoup(response.text, "html.parser")
