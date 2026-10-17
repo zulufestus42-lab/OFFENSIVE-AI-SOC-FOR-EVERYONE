@@ -1,6 +1,6 @@
 import os
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -71,7 +71,10 @@ def scan(req: Offensive, request: Request):
     if forwarded_for:
         client_ip = forwarded_for.split(",")[0].strip()
 
-    timestamp = datetime.utcnow().isoformat()
+    # Central Africa Time (Zambia is UTC+2)
+    CAT = timezone(timedelta(hours=2))
+    timestamp = datetime.now(CAT).isoformat()
+    
     path = request.headers.get("x-original-uri", "/v1/scan")
 
     # Fetch geolocation data (latitude & longitude) based on IP
