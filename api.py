@@ -1,7 +1,7 @@
 import os
 import warnings
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
@@ -13,6 +13,9 @@ from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from openai import OpenAI
+
+# Forwards each scan to the live Offense AI dashboard. Keep dashboard_push.py next to this file.
+from dashboard_push import push_to_dashboard
 
 # 1. Suppress scikit-learn version mismatch warnings on model load
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
@@ -81,7 +84,7 @@ class ReportRequest(BaseModel):
 
 
 @app.post("/v1/scan")
-def scan(req: Offensive, request: Request):
+def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
     # Extract client IP (handling proxies/load balancers like Render or Cloudflare)
     client_ip = request.client.host if request.client else "127.0.0.1"
     forwarded_for = request.headers.get("x-forwarded-for")
@@ -148,6 +151,9 @@ def scan(req: Offensive, request: Request):
         print(f"Database save error: {db_err}")
     finally:
         db.close()
+
+    # Push this event to the live dashboard after the response is sent (never blocks the scan).
+    background_tasks.add_task(push_to_dashboard, attack_log, req.payload)
 
     return attack_log
 
