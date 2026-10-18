@@ -215,7 +215,16 @@ def crawler_scan(req: CrawlerRequest):
     target = req.target_url.rstrip("/")
     vulnerabilities = []
     forms_found = 0
-    headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
+    probe_log = []  # diagnostics: what each probe actually saw
+    # Browser-like UA so WAF/Cloudflare bot filters don't silently challenge us.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    def log(path, **kw):
+        probe_log.append({"path": path, **kw})
 
     def record(path, method, param, vuln_type, severity, evidence, probe):
         vulnerabilities.append({
@@ -243,6 +252,7 @@ def crawler_scan(req: CrawlerRequest):
         ]
         try:
             response = client.get(target)
+            log(target, phase="landing", status=response.status_code, bytes=len(response.text))
             soup = BeautifulSoup(response.text, "html.parser")
             forms = soup.find_all("form")
             forms_found = len(forms)
@@ -263,8 +273,8 @@ def crawler_scan(req: CrawlerRequest):
                                        f"Response matched indicator '{hit}' after injection", item["payload"])
                         except Exception:
                             continue
-        except Exception:
-            pass  # a SPA may still be scanned by Phase 2 even if the landing page fails to parse
+        except Exception as e:
+            log(target, phase="landing", error=str(e)[:200])
 
         # ---- Phase 2: JSON-API / SPA probes -----------------------------------
         # Login auth-bypass: a tautology in a login field should never succeed.
@@ -274,15 +284,21 @@ def crawler_scan(req: CrawlerRequest):
             try:
                 baseline = client.post(url, json={"email": f"nouser-{XSS_MARKER}@example.com",
                                                   "password": f"wrong-{XSS_MARKER}"})
-            except Exception:
+            except Exception as e:
+                log(url, phase="login-baseline", error=str(e)[:200])
                 continue
             if baseline.status_code == 404:
+                log(url, phase="login", status=404, note="not found, skipped")
                 continue
             try:
                 injected = client.post(url, json={"email": "' OR 1=1--", "password": "x"})
-            except Exception:
+            except Exception as e:
+                log(url, phase="login-inject", error=str(e)[:200])
                 continue
             body = injected.text.lower()
+            log(url, phase="login", baseline_status=baseline.status_code,
+                inject_status=injected.status_code, inject_bytes=len(injected.text),
+                has_token=("token" in body or "authentication" in body or "bearer" in body))
             leaked = next((ind for ind in SQL_ERROR_INDICATORS if ind in body), None)
             if leaked:
                 record(url, "POST", "email", "SQL Injection", "high",
@@ -301,12 +317,15 @@ def crawler_scan(req: CrawlerRequest):
             # SQL injection via single quote
             try:
                 inj = client.get(url, params={"q": "'"})
-            except Exception:
+            except Exception as e:
+                log(url, phase="search", error=str(e)[:200])
                 continue
             if inj.status_code == 404:
+                log(url, phase="search", status=404, note="not found, skipped")
                 continue
             body = inj.text.lower()
             leaked = next((ind for ind in SQL_ERROR_INDICATORS if ind in body), None)
+            log(url, phase="search", status=inj.status_code, bytes=len(inj.text), sql_error=bool(leaked))
             if leaked:
                 record(url, "GET", "q", "SQL Injection", "high",
                        f"Search endpoint leaked a SQL error ('{leaked}') on a single-quote payload", "'")
@@ -332,6 +351,7 @@ def crawler_scan(req: CrawlerRequest):
             "HIGHEST_SEVERITY": ("critical" if "critical" in severities else
                                  "high" if "high" in severities else
                                  "medium" if "medium" in severities else "none"),
+            "PROBE_LOG": probe_log,
             "INSTRUCTION_FOR_LLM": "Analyze these confirmed live findings. Write an executive summary, explain the exact attack vector, and output secure remediation code blocks."
         }
 
