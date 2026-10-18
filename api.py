@@ -183,111 +183,155 @@ def get_logs(limit: int = 50):
 
 
 # 4. Active DAST Crawler & Vulnerability Assessment Endpoint
+#
+# Works on BOTH classic server-rendered sites (HTML <form> tags) AND modern
+# single-page apps / JSON APIs (Angular, React, Vue) that have no forms and talk
+# to /rest or /api endpoints. Endpoints that don't exist simply 404 and are
+# skipped, so the same scan is safe to run against any authorized target.
+
+# SQL-error fingerprints across common databases. If any of these leak into a
+# response after we send a single quote, the parameter is injectable.
+SQL_ERROR_INDICATORS = [
+    "sql syntax", "syntax error", "unclosed quotation", "unterminated string",
+    "unrecognized token", "sqlite_error", "sqlite3.", "mysql_fetch", "mysqli",
+    "pg_query", "psql:", "ora-0", "odbc", "sqlstate", "sqlexception",
+    "you have an error in your sql", "warning: mysql", "near \"'\"",
+]
+XSS_MARKER = "offai7xssprobe"  # unique token so a reflection can't be a coincidence
+
+
+def _classify_confidence(probe: str) -> str:
+    """Score the probe string with the existing ML model (best effort)."""
+    try:
+        vec = vectorizer.transform([probe])
+        prob = model.predict_proba(vec)[0].max()
+        return f"{round(float(prob) * 100, 2)}%"
+    except Exception:
+        return "n/a"
+
+
 @app.post("/v1/crawler/scan")
 def crawler_scan(req: CrawlerRequest):
-    target = req.target_url
+    target = req.target_url.rstrip("/")
     vulnerabilities = []
-    
-    test_payloads = [
-        {
-            "type": "SQLi", 
-            "payload": "' OR '1'='1", 
-            "indicators": ["sql syntax", "syntax error", "unclosed quotation mark", "mysql_fetch", "pg_query"]
-        },
-        {
-            "type": "Reflected XSS", 
-            "payload": "<script>alert('XSS_TEST')</script>", 
-            "indicators": ["<script>alert('XSS_TEST')</script>"]
-        },
-        {
-            "type": "Command Injection", 
-            "payload": "; cat /etc/passwd", 
-            "indicators": ["root:x:", "bin:x:", "daemon:x:"]
-        }
-    ]
+    forms_found = 0
+    headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
+
+    def record(path, method, param, vuln_type, severity, evidence, probe):
+        vulnerabilities.append({
+            "PATH": path,
+            "METHOD": method.upper(),
+            "PARAMETER": param,
+            "VULNERABILITY_TYPE": vuln_type,
+            "SEVERITY": severity,
+            "TEST_PAYLOAD": probe,
+            "EVIDENCE": evidence,
+            "CONFIDENCE": _classify_confidence(probe),
+        })
 
     try:
-        headers = {"User-Agent": "OffensiveAI-ActiveScanner/1.0"}
-        client = httpx.Client(timeout=30.0, follow_redirects=True, verify=False)
-        
-        response = client.get(target, headers=headers)
-        soup = BeautifulSoup(response.text, "html.parser")
-        forms = soup.find_all("form")
-        
-        discovered_forms = []
-        for form in forms:
-            action = form.get("action", "")
-            method = form.get("method", "get").lower()
-            form_url = urljoin(target, action)
-            inputs = form.find_all(["input", "textarea"])
-            input_names = [i.get("name") for i in inputs if i.get("name")]
-            
-            if input_names:
-                discovered_forms.append({
-                    "path": form_url,
-                    "method": method,
-                    "parameters": input_names
-                })
+        client = httpx.Client(timeout=20.0, follow_redirects=True, verify=False, headers=headers)
 
-        if not discovered_forms:
-            discovered_forms.append({
-                "path": target,
-                "method": "get",
-                "parameters": ["q", "search", "id"]
-            })
+        # ---- Phase 1: classic HTML <form> crawl -------------------------------
+        form_payloads = [
+            {"type": "SQL Injection", "severity": "high", "payload": "' OR '1'='1",
+             "indicators": SQL_ERROR_INDICATORS},
+            {"type": "Reflected XSS", "severity": "medium", "payload": f"<script>{XSS_MARKER}</script>",
+             "indicators": [f"<script>{XSS_MARKER}</script>"]},
+            {"type": "Command Injection", "severity": "critical", "payload": "; cat /etc/passwd",
+             "indicators": ["root:x:", "bin:x:", "daemon:x:"]},
+        ]
+        try:
+            response = client.get(target)
+            soup = BeautifulSoup(response.text, "html.parser")
+            forms = soup.find_all("form")
+            forms_found = len(forms)
+            for form in forms:
+                action = form.get("action", "")
+                method = form.get("method", "get").lower()
+                form_url = urljoin(target + "/", action)
+                input_names = [i.get("name") for i in form.find_all(["input", "textarea"]) if i.get("name")]
+                for param in input_names:
+                    for item in form_payloads:
+                        try:
+                            data = {param: item["payload"]}
+                            res = client.post(form_url, data=data) if method == "post" else client.get(form_url, params=data)
+                            body = res.text.lower()
+                            hit = next((ind for ind in item["indicators"] if ind.lower() in body), None)
+                            if hit:
+                                record(form_url, method, param, item["type"], item["severity"],
+                                       f"Response matched indicator '{hit}' after injection", item["payload"])
+                        except Exception:
+                            continue
+        except Exception:
+            pass  # a SPA may still be scanned by Phase 2 even if the landing page fails to parse
 
-        for form in discovered_forms:
-            form_path = form["path"]
-            method = form["method"]
-            
-            for param in form["parameters"]:
-                for item in test_payloads:
-                    attack_type = item["type"]
-                    probe = item["payload"]
-                    indicators = item["indicators"]
-                    
-                    try:
-                        data = {param: probe}
-                        if method == "post":
-                            res = client.post(form_path, data=data, headers=headers)
-                        else:
-                            res = client.get(form_path, params=data, headers=headers)
-                        
-                        response_body = res.text.lower()
-                        is_vulnerable = False
-                        matched_indicator = ""
-                        
-                        for indicator in indicators:
-                            if indicator.lower() in response_body:
-                                is_vulnerable = True
-                                matched_indicator = indicator
-                                break
-                        
-                        vec = vectorizer.transform([probe])
-                        prob = model.predict_proba(vec)[0].max()
+        # ---- Phase 2: JSON-API / SPA probes -----------------------------------
+        # Login auth-bypass: a tautology in a login field should never succeed.
+        login_paths = ["/rest/user/login", "/api/login", "/login", "/api/users/login", "/auth/login"]
+        for lp in login_paths:
+            url = target + lp
+            try:
+                baseline = client.post(url, json={"email": f"nouser-{XSS_MARKER}@example.com",
+                                                  "password": f"wrong-{XSS_MARKER}"})
+            except Exception:
+                continue
+            if baseline.status_code == 404:
+                continue
+            try:
+                injected = client.post(url, json={"email": "' OR 1=1--", "password": "x"})
+            except Exception:
+                continue
+            body = injected.text.lower()
+            leaked = next((ind for ind in SQL_ERROR_INDICATORS if ind in body), None)
+            if leaked:
+                record(url, "POST", "email", "SQL Injection", "high",
+                       f"Login endpoint leaked a SQL error ('{leaked}') on a single-quote payload", "' OR 1=1--")
+            elif injected.status_code == 200 and baseline.status_code in (400, 401, 403) and \
+                    ("token" in body or "authentication" in body or "bearer" in body):
+                record(url, "POST", "email", "SQL Injection (authentication bypass)", "critical",
+                       "Tautology payload bypassed login: rejected valid-shaped bad creds, "
+                       "but the injection returned 200 with an auth token", "' OR 1=1--")
 
-                        if is_vulnerable:
-                            vulnerabilities.append({
-                                "PATH": form_path,
-                                "METHOD": method.upper(),
-                                "PARAMETER": param,
-                                "VULNERABILITY_TYPE": attack_type,
-                                "TEST_PAYLOAD": probe,
-                                "EVIDENCE": f"Triggered by matching indicator: '{matched_indicator}'",
-                                "CONFIDENCE": f"{round(float(prob) * 100, 2)}%"
-                            })
-                            
-                    except Exception:
-                        continue
+        # Search / listing injection + reflected XSS.
+        search_paths = ["/rest/products/search", "/api/products", "/rest/track-order",
+                        "/search", "/api/search", "/products"]
+        for sp in search_paths:
+            url = target + sp
+            # SQL injection via single quote
+            try:
+                inj = client.get(url, params={"q": "'"})
+            except Exception:
+                continue
+            if inj.status_code == 404:
+                continue
+            body = inj.text.lower()
+            leaked = next((ind for ind in SQL_ERROR_INDICATORS if ind in body), None)
+            if leaked:
+                record(url, "GET", "q", "SQL Injection", "high",
+                       f"Search endpoint leaked a SQL error ('{leaked}') on a single-quote payload", "'")
+            # Reflected XSS
+            try:
+                xss = client.get(url, params={"q": f"<script>{XSS_MARKER}</script>"})
+                if f"<script>{XSS_MARKER}</script>".lower() in xss.text.lower():
+                    record(url, "GET", "q", "Reflected XSS", "medium",
+                           "Search parameter reflected the script payload unescaped",
+                           f"<script>{XSS_MARKER}</script>")
+            except Exception:
+                pass
 
         client.close()
 
+        severities = [v["SEVERITY"] for v in vulnerabilities]
         return {
             "TARGET": target,
             "STATUS": "SUCCESS",
-            "TOTAL_FORMS_FOUND": len(forms),
+            "TOTAL_FORMS_FOUND": forms_found,
             "VULNERABILITIES_DETECTED": len(vulnerabilities),
             "FINDINGS": vulnerabilities,
+            "HIGHEST_SEVERITY": ("critical" if "critical" in severities else
+                                 "high" if "high" in severities else
+                                 "medium" if "medium" in severities else "none"),
             "INSTRUCTION_FOR_LLM": "Analyze these confirmed live findings. Write an executive summary, explain the exact attack vector, and output secure remediation code blocks."
         }
 
