@@ -28,7 +28,7 @@ Base = declarative_base()
 
 class AttackLogDB(Base):
     __tablename__ = "attack_logs"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     ip = Column(String, index=True)
     timestamp = Column(String)
@@ -38,6 +38,21 @@ class AttackLogDB(Base):
     payload_type = Column(String)
     confidence = Column(String)
     action = Column(String)
+
+# --- Shared threat intelligence (network IP reputation) -----------------------
+# ADDITIVE + FLAG-GATED. With SHARED_INTEL off (the default) nothing below changes
+# the behaviour of /v1/scan. This is its own table; attack_logs is never altered.
+SHARED_INTEL = os.environ.get("SHARED_INTEL", "off").strip().lower() in ("on", "true", "1", "yes")
+
+class ThreatActorDB(Base):
+    __tablename__ = "threat_actors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ip = Column(String, unique=True, index=True)
+    hits = Column(Integer, default=0)
+    last_type = Column(String)
+    first_seen = Column(String)
+    last_seen = Column(String)
 
 # Create the database tables
 Base.metadata.create_all(bind=engine)
@@ -83,6 +98,33 @@ class ReportRequest(BaseModel):
     scan_results: dict
 
 
+def record_and_check_actor(ip, attack_type, action, now_iso):
+    """
+    Network IP reputation. Best-effort; NEVER raises to the caller.
+    Returns True if this IP was ALREADY a known attacker before this request.
+    If the request is itself an attack (action == BLOCK), the IP is remembered.
+    """
+    db = SessionLocal()
+    try:
+        actor = db.query(ThreatActorDB).filter(ThreatActorDB.ip == ip).first()
+        already_known = bool(actor and (actor.hits or 0) > 0)
+        if action == "BLOCK":
+            if actor:
+                actor.hits = (actor.hits or 0) + 1
+                actor.last_type = attack_type
+                actor.last_seen = now_iso
+            else:
+                db.add(ThreatActorDB(ip=ip, hits=1, last_type=attack_type,
+                                     first_seen=now_iso, last_seen=now_iso))
+            db.commit()
+        return already_known
+    except Exception as e:
+        print(f"Threat-intel error: {e}")
+        return False
+    finally:
+        db.close()
+
+
 @app.post("/v1/scan")
 def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
     # Extract client IP (handling proxies/load balancers like Render or Cloudflare)
@@ -94,7 +136,7 @@ def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
     # Central Africa Time (Zambia is UTC+2)
     CAT = timezone(timedelta(hours=2))
     timestamp = datetime.now(CAT).isoformat()
-    
+
     path = request.headers.get("x-original-uri", "/v1/scan")
 
     # Fetch geolocation data (latitude & longitude) based on IP
@@ -120,6 +162,23 @@ def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
     action = "BLOCK" if attack_type != "Benign" else "ALLOW"
     confidence_str = f"{round(float(prob) * 100, 2)}%"
 
+    # --- Shared threat intelligence (additive, flag-gated, never fatal) --------
+    # If this IP has attacked the network before, block it on sight — even on a
+    # request the model would otherwise allow ("known bad actor"). With the flag
+    # off, this block is skipped entirely and behaviour is exactly as before.
+    network_flagged = False
+    if SHARED_INTEL:
+        try:
+            already_known = record_and_check_actor(client_ip, attack_type, action, timestamp)
+            if already_known:
+                network_flagged = True
+                if action != "BLOCK":
+                    action = "BLOCK"
+                    attack_type = "Known bad actor (network-flagged)"
+                    confidence_str = "100.0%"
+        except Exception as e:
+            print(f"Threat-intel skipped: {e}")
+
     # Construct the telemetry payload
     attack_log = {
         "IP": client_ip,
@@ -129,7 +188,8 @@ def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
         "LONGITUDE": longitude,
         "PAYLOAD": attack_type,
         "CONFIDENCE": confidence_str,
-        "ACTION": action
+        "ACTION": action,
+        "NETWORK_FLAGGED": network_flagged
     }
 
     # Save telemetry log to SQLite database
@@ -178,6 +238,49 @@ def get_logs(limit: int = 50):
             }
             for log in logs
         ]
+    finally:
+        db.close()
+
+
+# 3b. Network threat-intelligence: the shared "known bad actors" the platform has
+# learned. Powers the "network protection" panel. Safe to call with the flag off
+# (it just returns an empty list until the table has entries).
+@app.get("/v1/intel")
+def get_intel(limit: int = 100):
+    db = SessionLocal()
+    try:
+        actors = db.query(ThreatActorDB).order_by(ThreatActorDB.hits.desc()).limit(limit).all()
+        return {
+            "ENABLED": SHARED_INTEL,
+            "FLAGGED_ACTORS": len(actors),
+            "ACTORS": [
+                {
+                    "IP": a.ip,
+                    "HITS": a.hits,
+                    "LAST_TYPE": a.last_type,
+                    "FIRST_SEEN": a.first_seen,
+                    "LAST_SEEN": a.last_seen,
+                }
+                for a in actors
+            ],
+        }
+    finally:
+        db.close()
+
+
+# 3c. Reset the network blocklist between demos. DISABLED unless you set the env
+# var INTEL_ADMIN_TOKEN and send it as the x-admin-token header — safe by default.
+@app.post("/v1/intel/clear")
+def clear_intel(request: Request):
+    required = os.environ.get("INTEL_ADMIN_TOKEN", "")
+    token = request.headers.get("x-admin-token", "")
+    if not required or token != required:
+        return {"STATUS": "DISABLED", "DETAIL": "set INTEL_ADMIN_TOKEN and send x-admin-token to use"}
+    db = SessionLocal()
+    try:
+        n = db.query(ThreatActorDB).delete()
+        db.commit()
+        return {"STATUS": "CLEARED", "REMOVED": n}
     finally:
         db.close()
 
@@ -368,7 +471,7 @@ def crawler_scan(req: CrawlerRequest):
 def generate_llm_report(req: ReportRequest):
     try:
         findings_json = str(req.scan_results)
-        
+
         system_prompt = (
             "You are the official automated intelligence reporting engine for 'OFFENSIVE AI SOC FOR EVERYONE'. "
             "Every report you create must prominently display 'OFFENSIVE AI SOC FOR EVERYONE' as the primary header. "
@@ -378,7 +481,7 @@ def generate_llm_report(req: ReportRequest):
             "2. Technical Attack Vector Breakdown "
             "3. Production-ready secure remediation code patches."
         )
-        
+
         user_prompt = f"Here are the live target scan results:\n{findings_json}\n\nGenerate the complete CISO security report now."
 
         response = llm_client.chat.completions.create(
