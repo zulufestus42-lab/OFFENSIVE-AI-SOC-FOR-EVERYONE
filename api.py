@@ -72,6 +72,11 @@ model = joblib.load("off_model.joblib")
 vectorizer = joblib.load("tfidf_vectorizer.joblib")
 labels_map = joblib.load("label_map.joblib")
 
+# In-memory geolocation cache (IP -> (lat, lon)). Keeps the live map fast and
+# avoids ipapi.co rate limits when the same attacker hits repeatedly during a
+# demo. Resets on restart; purely additive, affects nothing else.
+_geo_cache = {}
+
 # Initialize OpenAI client pointing to Groq's free endpoint
 llm_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
@@ -139,16 +144,24 @@ def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
 
     path = request.headers.get("x-original-uri", "/v1/scan")
 
-    # Fetch geolocation data (latitude & longitude) based on IP
+    # Fetch geolocation data (latitude & longitude) based on IP.
+    # Cached per IP in memory so repeated attacks from the same source don't
+    # re-hit ipapi (avoids its rate limit during a live demo).
     latitude, longitude = 0.0, 0.0
     try:
         if client_ip not in ["127.0.0.1", "localhost", "::1"]:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            response = httpx.get(f"https://ipapi.co/{client_ip}/json/", headers=headers, timeout=4.0, verify=False)
-            if response.status_code == 200:
-                geo_data = response.json()
-                latitude = geo_data.get("latitude", 0.0) or 0.0
-                longitude = geo_data.get("longitude", 0.0) or 0.0
+            cached = _geo_cache.get(client_ip)
+            if cached:
+                latitude, longitude = cached
+            else:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                response = httpx.get(f"https://ipapi.co/{client_ip}/json/", headers=headers, timeout=4.0, verify=False)
+                if response.status_code == 200:
+                    geo_data = response.json()
+                    latitude = geo_data.get("latitude", 0.0) or 0.0
+                    longitude = geo_data.get("longitude", 0.0) or 0.0
+                    if latitude or longitude:
+                        _geo_cache[client_ip] = (latitude, longitude)
     except Exception as e:
         print(f"Geo lookup error: {e}")
         pass
