@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -43,6 +44,86 @@ class AttackLogDB(Base):
 # ADDITIVE + FLAG-GATED. With SHARED_INTEL off (the default) nothing below changes
 # the behaviour of /v1/scan. This is its own table; attack_logs is never altered.
 SHARED_INTEL = os.environ.get("SHARED_INTEL", "off").strip().lower() in ("on", "true", "1", "yes")
+
+# --- Critical alerts via ntfy.sh (free phone push) ----------------------------
+# ADDITIVE + FLAG-GATED. With ALERTS off (the default) nothing here runs, and
+# /v1/scan behaves exactly as before. Only BLOCKed attacks at/above the
+# confidence threshold page the owner, with a per-IP cooldown so a burst of
+# attacks doesn't spam the phone.
+ALERTS = os.environ.get("ALERTS", "off").strip().lower() in ("on", "true", "1", "yes")
+NTFY_URL = os.environ.get("NTFY_URL", "").strip()            # e.g. https://ntfy.sh/your-topic
+ALERT_MIN_CONFIDENCE = float(os.environ.get("ALERT_MIN_CONFIDENCE", "60"))
+ALERT_COOLDOWN_SEC = int(os.environ.get("ALERT_COOLDOWN_SEC", "120"))
+_alert_cooldown = {}  # ip -> last epoch seconds
+
+
+def _humanize_attack(attack_type, confidence):
+    """Turn a technical attack label into a plain-English description anyone gets."""
+    t = (attack_type or "").lower()
+    if "sql" in t:
+        name = "database break-in attempt"
+        what = "Someone tried to trick your login into exposing your database."
+    elif "xss" in t or "cross" in t or "script" in t:
+        name = "malicious code injection"
+        what = "Someone tried to sneak harmful code into your site to target your visitors."
+    elif "command" in t:
+        name = "server takeover attempt"
+        what = "Someone tried to run their own commands on your server."
+    elif "path" in t or "traversal" in t:
+        name = "private file snooping attempt"
+        what = "Someone tried to reach files that are meant to stay private."
+    elif "network" in t or "known bad" in t:
+        name = "repeat attacker"
+        what = "An attacker your system already caught before came back and tried again."
+    else:
+        name = "web attack"
+        what = "Someone sent a harmful request to your website."
+    try:
+        c = float(str(confidence).rstrip("%"))
+        certainty = "Very high" if c >= 90 else "High" if c >= 70 else "Medium"
+    except Exception:
+        certainty = "High"
+    return name, what, certainty
+
+
+def send_ntfy_alert(attack_log):
+    """Push a plain-language critical-attack alert to the owner's phone. Never raises."""
+    try:
+        if not NTFY_URL:
+            return
+        ip = attack_log.get("IP", "?")
+        now = time.time()
+        if now - _alert_cooldown.get(ip, 0) < ALERT_COOLDOWN_SEC:
+            return
+        _alert_cooldown[ip] = now
+
+        attack_type = attack_log.get("PAYLOAD", "attack")
+        name, what, certainty = _humanize_attack(attack_type, attack_log.get("CONFIDENCE"))
+
+        when = attack_log.get("TIMESTAMP", "")
+        try:
+            when = datetime.fromisoformat(when).strftime("%H:%M on %d %b")
+        except Exception:
+            pass
+
+        title = "Attack blocked on your website"
+        msg = (
+            f"Your Offensive AI firewall just stopped a {name}.\n\n"
+            f"{what}\n\n"
+            f"Blocked automatically - your website is safe, nothing for you to do.\n"
+            f"Certainty: {certainty}\n"
+            f"Time: {when}\n\n"
+            f"(Technical: {attack_type} from {ip})"
+        )
+        httpx.post(
+            NTFY_URL,
+            content=msg.encode("utf-8"),
+            headers={"Title": title, "Priority": "high", "Tags": "shield,rotating_light"},
+            timeout=5.0,
+        )
+    except Exception as e:
+        print(f"ntfy alert error: {e}")
+
 
 class ThreatActorDB(Base):
     __tablename__ = "threat_actors"
@@ -227,6 +308,16 @@ def scan(req: Offensive, request: Request, background_tasks: BackgroundTasks):
 
     # Push this event to the live dashboard after the response is sent (never blocks the scan).
     background_tasks.add_task(push_to_dashboard, attack_log, req.payload)
+
+    # Critical alert: only BLOCKed attacks at/above the confidence threshold page
+    # the owner's phone. Runs in the background so it never slows the scan.
+    if ALERTS and action == "BLOCK":
+        try:
+            conf_pct = float(str(confidence_str).rstrip("%"))
+        except Exception:
+            conf_pct = 0.0
+        if conf_pct >= ALERT_MIN_CONFIDENCE:
+            background_tasks.add_task(send_ntfy_alert, attack_log)
 
     return attack_log
 
